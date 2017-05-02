@@ -1,0 +1,200 @@
+---
+title: "Final Project: CyTOF Analysis with a Combined Citrus/QIIME Approach"
+author: "Frank Santoriello"
+date: "5/1/2017"
+output: html_document
+---
+
+Rpubs link: <http://rpubs.com/fsantoriello/272732>
+
+```{r setup, include=FALSE}
+library("citrus",lib.loc=NULL)
+library("tidyverse")
+library("pheatmap")
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This is an R Markdown document explaining a workflow for analyzing high-demensional CyTOF data with a combined Citrus/QIIME approach. In this example, we will analyze peripheral blood from HIV+ (10) and HIV- (9) individuals in a COPD cohort. CyTOF analysis was performed on these samples using a 36 immune cell marker panel to determine shifts in the immune populations of the blood. Samples were barcoded and analyzed in a single run.  The output of this analysis is 20 standard FCS files.
+
+The general idea of this approach is the following:
+
+The Citrus algorithm clusters a subset of cells from each sample based on their marker profile and calls clusters above a certain percentange of the total data. A table of cluster abundances by sample name is generated from this analysis. This table is analagous in dimensionality to a QIIME biom table. Each cluster is analagous to a bacterial species and each corresponding value is analagous to the percentage of that species in the total sample. This file can thus be analyzed in QIIME using principal coordinates analysis (PCoA) to reduce the dimensionality. PCoA can then be crossed with sample metadata to identify the coordinates that contribute most strongly to the variance. 
+
+## Prepare Data for Processing
+
+Perform all appropriate normalizations on the raw FCS files (bead norm, debarcoding, etc.), and perform any desired pre-gating (CD45+, CD3+, CD19+, etc.). Save the pre-processed files in an R project directory along with this markdown document. 
+
+The data used in this example was debarcoded, bead normalized, and pre-gated down to live, single, CD45+ cells (pan-leukocyte marker).
+
+## Install Necessary Packages
+
+If you have not downloaded Citrus and or QIIME, use the following links to do so:
+
+Citrus: <https://github.com/nolanlab/citrus/wiki/Installing-Citrus>
+QIIME: <http://www.wernerlab.org/software/macqiime/macqiime-installation>
+
+## Perform Citrus Clustering
+
+The Citrus algorithm performs best with 8-10 samples per tested condition. Below this number, the error is high and results can be spurious. The citrus.foldClustering step will take time dependent on how many events are being clustered. The script is most likely running fine, it just needs time to run.
+
+The following code block will open the Citrus GUI in a new browser window. From there you can group your FCS files into two or more experimental/control groups, select the channels upon which you wish to cluster your samples, and define the appropriate citrus algorithm (pamr, glmnet, sam). When finished, citrus will return to R to run the program.  
+
+This analysis will be performed with samples grouped by HIV status. Clustering will be performed using all 36 markers, and clusters will be called above a threshold of 2% of the total data. Regression will be performed using glmnet regression.
+
+```{r runCitrus, results='hide'}
+
+# Identify data and parameters. Run citrus.
+citrus.launchUI(dataDirectory = "~/Desktop/School_Stuff/Courses/GENOMICS/FinalProject/Barcoded/CD45/")
+
+```
+
+The clustering data from the citrus run can then be loaded into the R environment for data extraction and processing. From the citrus clustering, we can pull a table of cluster abundances by sample name.
+
+```{r clustering}
+# Load clustering data
+load(file.path(outputDirectory,"citrusClustering.rData"))
+print(citrus.foldClustering$allClustering)
+
+# Make vector of conditions for analysis. If comparing two conditions, should be 
+# two elements - first element is baseline condition and second is comparison condition.
+conditions = colnames(fileList)[1]
+  
+# Build cluster features
+citrus.foldFeatureSet = citrus.calculateFoldFeatureSet(citrus.foldClustering,citrus.combinedFCSSet,
+                                                       featureType=featureType,
+                                                       minimumClusterSizePercent=minimumClusterSizePercent,
+                                                       conditions=conditions
+                                                       )
+  
+# Format and export cluster abundances
+
+clusterAbundances <- t(as.matrix(citrus.foldFeatureSet$allFeatures))
+
+clustAbun <- as_tibble(cbind("#cluster" = rownames(clusterAbundances), clusterAbundances))
+
+clustAbun %>% 
+  mutate_each(funs(as.numeric),ends_with("fcs")) -> clustAbun
+
+clustAbun
+
+write_tsv(clustAbun,file.path(outputDirectory,"clusterAbundances.txt"))
+
+```
+
+
+## PCoA Analysis of Cluster Abundances
+
+Cluster abundance data can now be run through a standard QIIME biom analysis to define factors contributing most strongly to the variance of the data. 
+
+In order to perform this analysis, you will need two files:
+
+1. clusterAbundances.txt - this file is generated in this script
+
+2. A mapping file (.txt) containing metadata. The final column must be "description" - this file should be generated outside of the script and placed in the project directory. The mapping file used here details SampleID, HIV Status, Smoking or Non, Date Processed, Run Date, Storage Term, Storage Group, and Description.
+
+```{bash qiime, message = FALSE}
+
+#Copy mapping file to the citrusOutput directory
+
+cp Barcoded/CD45/Barcoded_Blood_Metadata_sheet.txt Barcoded/CD45/citrusOutput/
+
+#Call MacQIIME. 
+#If you are running El Capitan (OS 10.11) un-comment and run the first line. If not, run the second line.
+
+#macqiime
+source /macqiime/configs/bash_profile.txt
+
+#Convert cluster abundances to OTU table format
+biom convert --table-type "OTU table" --to-hdf5\
+  -i Barcoded/CD45/citrusOutput/clusterAbundances.txt\
+  -o Barcoded/CD45/citrusOutput/clusterAbundances.biom 
+
+#Calculate beta diversity between samples  
+beta_diversity.py -i Barcoded/CD45/citrusOutput/clusterAbundances.biom\
+  -m euclidean\
+  -o Barcoded/CD45/citrusOutput/clusterAbundances_euclidean
+  
+#Calculate the principal coordinates of the variance  
+principal_coordinates.py -i Barcoded/CD45/citrusOutput/clusterAbundances_euclidean/euclidean_clusterAbundances.txt\
+  -o Barcoded/CD45/citrusOutput/clusterAbundances_PCoA.txt
+
+#Generate an interactive emperor plot
+make_emperor.py -i Barcoded/CD45/citrusOutput/clusterAbundances_PCoA.txt\
+  -m Barcoded/CD45/citrusOutput/Barcoded_Blood_Metadata_sheet.txt\
+  -o Barcoded/CD45/citrusOutput/clusterAbundances_emperor
+
+```
+
+The output of this workflow is the "index.html" file containing the generated emperor plot. This plot can be modified with the metadata provided in the mapping file by opening the HTML file locally in your browser, thus opening the Emperor GUI.
+
+##Comparison of Different Analyses
+
+###1) Clustering with dist()
+
+Traditional clustering methods like dist() allow for reduction of dimensionality, but doesn't account for the different vectors contributing to the variance of these samples. 
+
+```{r euclidean clustering}
+
+#Generate euclidean distance matrix
+distMat <- dist(t(clusterAbundances), method = 'euclidean')
+
+#Heatmap vizualize the distance matrix
+pheatmap(distMat, 
+         color = colorRampPalette(c("navy", "white"))(25),
+         labels_col = colnames(clusterAbundances))
+
+```
+
+
+###2) Citrus Clustering
+
+Citrus clustering is too high-dimensional. The power of this analysis is great, but the current method of analysis in the field is plot-gazing to identify trends. 
+
+
+![Citrus Output Marker Plots](/Users/franksantoriello/Desktop/School_Stuff/Courses/GENOMICS/FinalProject/Barcoded/CD45/citrusOutput/defaultCondition/markerPlotsAll.pdf)
+
+
+
+This often leads to researchers picking a subset of markers to analyze rather than the entire panel of markers, severely reducing the power of the method.
+
+###3) QIIME-based PCoA Analysis with Emperor
+
+Analyzing the clusters generated by Citrus with QIIME allows for the reduction of dimensionality and the integration of metadata to pinpoint the key variables contributing to the variance.
+
+The emperor plot can be vizualized inline in a jupyter notebook with the previously generated "clusterAbundances_PCoA.txt" and a metadata mapping file using the following python code:
+
+```{python, engine.path = "/usr/local/bin/python2.7"}
+
+from skbio.stats.ordination import OrdinationResults
+from emperor import Emperor
+
+#Load and read data
+with open("Barcoded/CD45/citrusOutput/Barcoded_Blood_Metadata_sheet.txt","r") as f:
+  data = f.readlines()
+
+#Format data    
+for line in data:
+  lines = line.split("\r")
+
+lines = [lines[i:i+1] for i in range(0, len(lines), 1)] 
+items = [item.split("\t") for line in lines for item in line]
+
+metadata = items[1:]
+
+headers = items[0]
+
+ordination = OrdinationResults.read('Barcoded/CD45/citrusOutput/clusterAbundances_PCoA.txt')
+
+#Generate Emperor plot
+Emperor(ordination,metadata,headers)
+
+```
+
+Alternatively, an interactive Emperor GUI of the plot can be opened simply by opening the "index.htlm" file generated in the "/citrusOutput/clusterAbundances_emperor" directory. I have included here a screenshot of the Emperor plot generated by this script colored by HIV status. It appears that HIV status lies along PC1 as the main contributor to the variance. 
+
+![Interactive Emperor GUI](/Users/franksantoriello/Desktop/School_Stuff/Courses/GENOMICS/FinalProject/Barcoded/CD45/emperor_screenshot.png)
+
+
+
+
